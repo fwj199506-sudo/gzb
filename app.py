@@ -38,6 +38,27 @@ def clean_code_str(raw_code):
     code_str = re.sub(r'\s+([A-Za-z]{2,4})$', r'.\1', code_str)
     return code_str
 
+def extract_ticker(full_code):
+    """
+    从完整 CAS 科目代码中提取纯证券代码。
+    如 1103.02.01.122498.SH → 122498.SH
+       1102.34.01.301308.SZ → 301308.SZ
+       1108.01.01.WX6ZXT.OTC → WX6ZXT.OTC
+    CAS 层级段均为短代码（≤4位纯数字，或 B1 这类单字母+数字），
+    证券代码是第一个打破该规则的段及其后续部分。
+    """
+    code_str = clean_code_str(full_code)
+    if not code_str:
+        return ""
+    parts = code_str.split('.')
+    for i, p in enumerate(parts):
+        # CAS 层级：≤4 位纯数字，或单字母 + 可选 1 位数字（如 B1）
+        is_cas = len(p) <= 4 and (p.isdigit() or bool(re.match(r'^[A-Za-z]\d?$', p)))
+        if not is_cas:
+            return '.'.join(parts[i:])
+    # 兜底：返回最后两段
+    return '.'.join(parts[-2:]) if len(parts) >= 2 else code_str
+
 def top_level_value(row, idx_mkt=-1, idx_cost=-1):
     """
     取一行的主值：
@@ -56,10 +77,12 @@ def top_level_value(row, idx_mkt=-1, idx_cost=-1):
 
 def classify_asset(code, name):
     """
-    基于 CAS 科目代码层级分类
-    优先级：非标特征字 > 明确代码 > 股票/债券代码特征
+    基于 CAS 科目代码层级分类。
+    优先级：非标特征字 > 明确科目代码 > 代码特征兜底。
+    注意：code 参数会先经 clean_code_str 规范化（补交易所后缀点号），
+    确保正则 \b 断词正确（如 301308.SZ 而非 301308SZ）。
     """
-    c = norm_text(code)
+    c = clean_code_str(code)       # 用 clean_code_str 替代 norm_text，保证 .SH/.SZ 有点号
     n = norm_text(name)
     c_upper = c.upper()
 
@@ -72,10 +95,12 @@ def classify_asset(code, name):
         return '公募/私募基金'
 
     # 2) 明确科目代码
-    if c.startswith('1102.01') or c.startswith('110201'):
+    # 1102 及所有子类 → 股票（上交所 1102.01 / 深交所 1102.33 / 创业板 1102.34 等）
+    if c.startswith('1102'):
+        # 排除少数名称含"债"但代码误入 1102 的情形
+        if '债' in n and '股票' not in n and '股' not in n:
+            return '债券'
         return '股票'
-    if c.startswith('1102.03') or c.startswith('110203'):
-        return '债券'
     if c.startswith('1103'):
         return '债券'
     if c.startswith('1104') or '资产支持证券' in n or 'ABS' in c_upper:
@@ -85,14 +110,11 @@ def classify_asset(code, name):
     if c.startswith('1201') or c.startswith('1202') or '买入返售' in n or '逆回购' in n or '质押式' in n:
         return '买入返售(逆回购)'
 
-    # 3) 兜底判定
-    if c.startswith('1102'):
-        # 常见 A 股/北交所/创业板代码特征
-        if re.search(r'\b(00|30|60|68|83|87|43|92)\d{4}\b', c) or '股' in n:
-            return '股票'
-        if '债' in n:
-            return '债券'
-        return '其他交易性金融资产'
+    # 3) 兜底判定（非标准代码）
+    if re.search(r'\b(00|30|60|68|83|87|43|92)\d{4}\b', c) or '股' in n:
+        return '股票'
+    if '债' in n:
+        return '债券'
 
     return '未分类'
 
@@ -249,7 +271,7 @@ def process_valuation_files(uploaded_files):
 
                 # 明细表：只记录资产类持仓
                 if c_clean.startswith(('1102', '1103', '1104', '1108', '1201', '1202')):
-                    clean_code = "逆回购" if asset_type == '买入返售(逆回购)' else clean_code_str(c_raw)
+                    clean_code = "逆回购" if asset_type == '买入返售(逆回购)' else extract_ticker(c_raw)
 
                     detail_list.append({
                         "所属产品": product_name,
