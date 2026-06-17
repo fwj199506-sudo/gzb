@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import io
 import re
 import os
@@ -37,6 +38,16 @@ def clean_code_str(raw_code):
         return ""
     code_str = re.sub(r'\s+([A-Za-z]{2,4})$', r'.\1', code_str)
     return code_str
+
+def is_accrued_interest_row(code_str):
+    """
+    判断是否为应计利息子行（避免与本金行重复计算）。
+    债券估值表中每只券拆为本金(.01)和应计利息(.03)两行，
+    应计利息行科目代码含 .03. 层级标记，如 1103.06.03.196519.SH。
+    """
+    c = clean_code_str(code_str)
+    # .03. 在 CAS 层级中专指应计利息，不会出现在真实证券代码中
+    return '.03.' in c
 
 def extract_ticker(full_code):
     """
@@ -149,6 +160,7 @@ def process_valuation_files(uploaded_files):
         file_name = file.name
         base_name = os.path.splitext(file_name)[0]
         product_name = re.sub(r'(_资产估值表.*|_四级.*)$', '', base_name)
+        product_name = re.sub(r'^[A-Z0-9]+_', '', product_name)  # 去掉基金代码前缀如 SNK912_
 
         # 1. 原始读取
         try:
@@ -170,7 +182,10 @@ def process_valuation_files(uploaded_files):
             continue
 
         row0 = [norm_text(x) for x in df.iloc[header_idx].values]
-        row1 = [norm_text(x) for x in df.iloc[header_idx + 1].values] if header_idx + 1 < len(df) else row0
+        # 取第二行，但先判断是否为真正的双行表头（含 原币/本币 等二级标注）
+        row1_raw = [norm_text(x) for x in df.iloc[header_idx + 1].values] if header_idx + 1 < len(df) else row0
+        row1_is_header = any(k in row1_raw for k in ['本币', '原币', '金额', '数量'])
+        row1 = row1_raw if row1_is_header else row0  # 非双行表头则退化为单行匹配
 
         # 动态寻找列索引
         def find_idx(keys0, keys1=None):
@@ -265,8 +280,12 @@ def process_valuation_files(uploaded_files):
             if v_qty > 0:
                 asset_type = classify_asset(c_raw, n_raw)
 
-                # 排除明显汇总行
-                if any(x in n_clean for x in ['汇总', '合计', '大类', '交易所', '深交所', '上交所']):
+                # 排除明显汇总行、应计利息子行（避免与本金行重复计算）
+                if any(x in n_clean for x in ['汇总', '合计', '大类', '交易所', '深交所', '上交所', '银行间', '小计', '其中', '应计利息']):
+                    continue
+
+                # 排除应计利息子行（科目代码含 .03. 层级标记）
+                if is_accrued_interest_row(c_raw):
                     continue
 
                 # 明细表：只记录资产类持仓
@@ -314,6 +333,54 @@ def process_valuation_files(uploaded_files):
     df_det = pd.DataFrame(detail_list)
     return df_sum, df_det
 
+# ================= 跨产品合并分析引擎 =================
+def build_cross_product_analysis(df_sum, df_det):
+    """从产品汇总和明细表生成跨产品合并分析"""
+    if df_sum.empty or df_det.empty:
+        return None, None
+
+    # ---- Sheet 3a: 跨产品重仓证券 ----
+    # 仅保留有代码的证券（排除"逆回购"通用标记）
+    det_with_code = df_det[df_det['代码'].notna() & (df_det['代码'] != '') & (df_det['代码'] != '逆回购')].copy()
+    if det_with_code.empty:
+        return None, None
+
+    # 按代码聚合：统计涉及产品数、各产品持仓、合计市值
+    cross = det_with_code.groupby(['代码', '资产名称', '资产类别']).agg(
+        涉及产品数=('所属产品', 'nunique'),
+        涉及产品=('所属产品', lambda x: '、'.join(sorted(set(x)))),
+        合计数量=('数量', 'sum'),
+        合计成本=('总成本', 'sum'),
+        合计市值=('今日市值', 'sum'),
+        各产品持仓明细=('所属产品', lambda x: ' | '.join(
+            f"{p}({v:,.0f}张, 市值{m:,.2f})" for p, v, m in sorted(
+                set(zip(x, det_with_code.loc[x.index, '数量'], det_with_code.loc[x.index, '今日市值']))
+            )
+        ))
+    ).reset_index()
+
+    # 按合计市值降序，跨产品持有的排前面
+    cross['排序键'] = cross['涉及产品数'].apply(lambda x: 0 if x >= 2 else 1)
+    cross = cross.sort_values(['排序键', '合计市值'], ascending=[True, False]).drop(columns=['排序键'])
+    cross = cross.reset_index(drop=True)
+
+    # ---- Sheet 3b: 产品资产配置对比（仅占比，金额已在 Sheet 1） ----
+    if not df_sum.empty:
+        alloc = df_sum.copy().set_index('产品名称')
+        total_cols = ['银行存款', '结算备付金及保证金', '股票投资金额', '债券投资金额', '买入返售金融资产', '其他交易性金融资产']
+        pct_cols = []
+        for col in total_cols:
+            if col in alloc.columns:
+                pct_name = col.replace('投资金额', '').replace('金融资产', '')
+                alloc[pct_name + '占比'] = alloc[col] / alloc['总资产'].replace(0, np.nan)
+                pct_cols.append(pct_name + '占比')
+        alloc = alloc[pct_cols].reset_index()  # 仅保留占比列
+    else:
+        alloc = None
+
+    return cross, alloc
+
+
 # ================= 交互渲染 =================
 uploaded_files = st.file_uploader(
     "📂 请上传估值表文件 (多选 Excel/CSV)",
@@ -327,14 +394,104 @@ if uploaded_files:
 
     st.success(f"成功解析 {len(uploaded_files)} 个产品！")
 
+    # ---- 跨产品合并分析 ----
+    cross_df, alloc_df = None, None
+    if len(uploaded_files) >= 2:
+        cross_df, alloc_df = build_cross_product_analysis(df_sum, df_det)
+
+    # ================= Excel 导出 (先生成，下载按钮放最上面) =================
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df_sum.to_excel(writer, sheet_name='产品概况', index=False)
+        df_det.to_excel(writer, sheet_name='资产明细', index=False)
+        if cross_df is not None and not cross_df.empty:
+            cross_df.to_excel(writer, sheet_name='跨产品合并', index=False)
+        if alloc_df is not None:
+            alloc_df.to_excel(writer, sheet_name='产品配置对比', index=False)
+
+        # ---- 格式美化 ----
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        from openpyxl.utils import get_column_letter
+
+        header_font = Font(name='微软雅黑', size=11, bold=True, color='FFFFFF')
+        header_fill = PatternFill(start_color='1F4E79', end_color='1F4E79', fill_type='solid')
+        header_align = Alignment(horizontal='center', vertical='center', wrap_text=True)
+        cell_font = Font(name='微软雅黑', size=10)
+        cell_align = Alignment(horizontal='right', vertical='center')
+        cell_align_left = Alignment(horizontal='left', vertical='center')
+        thin_border = Border(
+            left=Side(style='thin', color='D0D0D0'),
+            right=Side(style='thin', color='D0D0D0'),
+            top=Side(style='thin', color='D0D0D0'),
+            bottom=Side(style='thin', color='D0D0D0'),
+        )
+        cross_fill = PatternFill(start_color='FFF2CC', end_color='FFF2CC', fill_type='solid')
+
+        for ws in writer.sheets.values():
+            ws.freeze_panes = 'A2'
+            if ws.max_row > 1:
+                ws.auto_filter.ref = ws.dimensions
+
+            for cell in ws[1]:
+                cell.font = header_font
+                cell.fill = header_fill
+                cell.alignment = header_align
+                cell.border = thin_border
+
+            for row in ws.iter_rows(min_row=2, max_row=ws.max_row, max_col=ws.max_column):
+                for cell in row:
+                    cell.font = cell_font
+                    cell.border = thin_border
+                    if isinstance(cell.value, (int, float)):
+                        cell.alignment = cell_align
+                        if abs(cell.value) >= 1000:
+                            cell.number_format = '#,##0.00'
+                        elif 0 < abs(cell.value) < 1:
+                            cell.number_format = '0.00%' if cell.value <= 1 else '0.00'
+                    elif cell.value is not None:
+                        cell.alignment = cell_align_left
+
+            if ws.title == '跨产品合并':
+                cross_col_idx = None
+                for col_idx, cell in enumerate(ws[1], 1):
+                    if cell.value == '涉及产品数':
+                        cross_col_idx = col_idx
+                        break
+                if cross_col_idx:
+                    for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+                        cell = row[cross_col_idx - 1]
+                        try:
+                            if cell.value is not None and float(cell.value) >= 2:
+                                for c in row:
+                                    c.fill = cross_fill
+                        except (ValueError, TypeError):
+                            pass
+
+            for col_idx in range(1, ws.max_column + 1):
+                col_letter = get_column_letter(col_idx)
+                max_width = 8
+                for row in ws.iter_rows(min_row=1, max_row=min(ws.max_row, 50), min_col=col_idx, max_col=col_idx):
+                    for cell in row:
+                        if cell.value:
+                            val = str(cell.value)
+                            width = sum(2 if ord(c) > 127 else 1 for c in val)
+                            max_width = max(max_width, min(width + 4, 55))
+                ws.column_dimensions[col_letter].width = max_width
+
+    st.download_button(
+        label="📥 点击下载精算级汇总 Excel 报表",
+        data=output.getvalue(),
+        file_name="私募产品多维度估值透视表_Final.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+    # ================= 下方：数据预览 =================
+    st.markdown("---")
     st.subheader("📋 Sheet 1: 产品资产概况")
     df_sum_show = df_sum.copy()
-
-    # 统一展示格式
     for col in df_sum_show.columns:
         if col != "产品名称":
             df_sum_show[col] = df_sum_show[col].apply(lambda x: f"{x:,.2f}")
-
     st.dataframe(df_sum_show, use_container_width=True)
 
     st.subheader("🔍 Sheet 2: 底层资产明细")
@@ -343,21 +500,30 @@ if uploaded_files:
         for col in ['数量', '单位成本', '总成本', '今日行情', '今日市值']:
             if col in df_det_show.columns:
                 df_det_show[col] = df_det_show[col].apply(lambda x: f"{x:,.2f}")
-
     st.dataframe(df_det_show, use_container_width=True)
 
-    # 导出文件
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df_sum.to_excel(writer, sheet_name='产品概况', index=False)
-        df_det.to_excel(writer, sheet_name='资产明细', index=False)
+    # ---- Sheet 3: 跨产品合并分析 ----
+    if cross_df is not None and not cross_df.empty:
+        st.subheader("🔗 Sheet 3: 跨产品合并分析")
 
-    st.markdown("---")
-    st.download_button(
-        label="📥 点击下载精算级汇总 Excel 报表",
-        data=output.getvalue(),
-        file_name="私募产品多维度估值透视表_Final.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
+        st.markdown("**跨产品重仓证券**（同一只券被多个产品持有，合并计算敞口）")
+        cross_show = cross_df.copy()
+        for col in ['合计数量', '合计成本', '合计市值']:
+            if col in cross_show.columns:
+                cross_show[col] = cross_show[col].apply(lambda x: f"{x:,.2f}")
+        st.dataframe(cross_show, use_container_width=True)
+
+        if alloc_df is not None:
+            st.markdown("**产品资产配置对比**")
+            alloc_show = alloc_df.copy()
+            for col in alloc_show.columns:
+                if '占比' in str(col):
+                    alloc_show[col] = alloc_show[col].apply(lambda x: f"{x:.2%}" if pd.notna(x) else "")
+                elif col != "产品名称":
+                    alloc_show[col] = alloc_show[col].apply(lambda x: f"{x:,.2f}")
+            st.dataframe(alloc_show, use_container_width=True)
+    elif len(uploaded_files) >= 2:
+        st.info("当前产品之间无共同持仓，或明细数据不足以进行跨产品分析。")
+
 else:
     st.info("提示：支持批量拖入估值表。算法已升级为精确总计行识别 + 底层明细穿透，避免子项重复累计。")
