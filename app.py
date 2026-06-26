@@ -116,6 +116,8 @@ def classify_asset(code, name):
         return '债券'
     if c.startswith('1104') or '资产支持证券' in n or 'ABS' in c_upper:
         return '债券'
+    if c.startswith('1105'):
+        return 'ETF/基金投资'
     if c.startswith('1108'):
         return '其他交易性金融资产'
     if c.startswith('1201') or c.startswith('1202') or '买入返售' in n or '逆回购' in n or '质押式' in n:
@@ -222,6 +224,7 @@ def process_valuation_files(uploaded_files):
         stocks = 0.0
         bonds = 0.0
         others = 0.0
+        fund_etf = 0.0
 
         # 3. 逐行解析
         for i in range(header_idx + 1, len(df)):
@@ -289,7 +292,7 @@ def process_valuation_files(uploaded_files):
                     continue
 
                 # 明细表：只记录资产类持仓
-                if c_clean.startswith(('1102', '1103', '1104', '1108', '1201', '1202')):
+                if c_clean.startswith(('1102', '1103', '1104', '1105', '1108', '1201', '1202')):
                     clean_code = "逆回购" if asset_type == '买入返售(逆回购)' else extract_ticker(c_raw)
 
                     detail_list.append({
@@ -315,6 +318,8 @@ def process_valuation_files(uploaded_files):
                     reverse_repo += v_val
                 elif asset_type in ['信托计划', '资管计划', '公募/私募基金', '其他交易性金融资产']:
                     others += v_val
+                elif asset_type == 'ETF/基金投资':
+                    fund_etf += v_val
 
         # 单个产品解析完毕，压入汇总表
         summary_list.append({
@@ -323,6 +328,7 @@ def process_valuation_files(uploaded_files):
             "结算备付金及保证金": clearing_prov,
             "股票投资金额": stocks,
             "债券投资金额": bonds,
+            "基金投资金额": fund_etf,
             "买入返售金融资产": reverse_repo,
             "其他交易性金融资产": others,
             "总资产": total_assets,
@@ -367,7 +373,7 @@ def build_cross_product_analysis(df_sum, df_det):
     # ---- Sheet 3b: 产品资产配置对比（仅占比，金额已在 Sheet 1） ----
     if not df_sum.empty:
         alloc = df_sum.copy().set_index('产品名称')
-        total_cols = ['银行存款', '结算备付金及保证金', '股票投资金额', '债券投资金额', '买入返售金融资产', '其他交易性金融资产']
+        total_cols = ['银行存款', '结算备付金及保证金', '股票投资金额', '债券投资金额', '基金投资金额', '买入返售金融资产', '其他交易性金融资产']
         pct_cols = []
         for col in total_cols:
             if col in alloc.columns:
@@ -478,10 +484,19 @@ if uploaded_files:
                             max_width = max(max_width, min(width + 4, 55))
                 ws.column_dimensions[col_letter].width = max_width
 
+    # 提取估值表日期用于输出文件名
+    val_date = ""
+    try:
+        date_match = re.search(r'_(\d{8})_', uploaded_files[0].name)
+        if date_match:
+            val_date = "_" + date_match.group(1)
+    except Exception:
+        pass
+
     st.download_button(
         label="📥 点击下载精算级汇总 Excel 报表",
         data=output.getvalue(),
-        file_name="私募产品多维度估值透视表_Final.xlsx",
+        file_name=f"私募产品多维度估值透视表{val_date}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
