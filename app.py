@@ -39,15 +39,35 @@ def clean_code_str(raw_code):
     code_str = re.sub(r'\s+([A-Za-z]{2,4})$', r'.\1', code_str)
     return code_str
 
+def extract_valuation_date(file_name):
+    """从估值表文件名提取 YYYYMMDD 估值日期。"""
+    date_match = re.search(r'_(\d{8})_', os.path.basename(str(file_name)))
+    return date_match.group(1) if date_match else ""
+
+def build_output_filename(uploaded_files):
+    """根据上传文件估值日期生成下载文件名，支持日期范围。"""
+    dates = sorted({
+        extract_valuation_date(getattr(file, "name", ""))
+        for file in uploaded_files
+        if extract_valuation_date(getattr(file, "name", ""))
+    })
+    if not dates:
+        suffix = ""
+    elif len(dates) == 1:
+        suffix = f"_{dates[0]}"
+    else:
+        suffix = f"_{dates[0]}-{dates[-1]}"
+    return f"私募产品多维度估值透视表{suffix}.xlsx"
+
 def is_accrued_interest_row(code_str):
     """
     判断是否为应计利息子行（避免与本金行重复计算）。
     债券估值表中每只券拆为本金(.01)和应计利息(.03)两行，
-    应计利息行科目代码含 .03. 层级标记，如 1103.06.03.196519.SH。
+    应计利息行的第三层 CAS 科目为 03，如 1103.06.03.196519.SH。
     """
     c = clean_code_str(code_str)
-    # .03. 在 CAS 层级中专指应计利息，不会出现在真实证券代码中
-    return '.03.' in c
+    parts = c.split('.')
+    return len(parts) >= 4 and parts[2] == '03'
 
 def extract_ticker(full_code):
     """
@@ -131,6 +151,39 @@ def classify_asset(code, name):
 
     return '未分类'
 
+def classify_position_bucket(code, name, asset_type=""):
+    """
+    新增仓位占比统计口径：
+    现金类资产、信用债、转债、权益、指数类资产、其他。
+    """
+    c = clean_code_str(code)
+    n = norm_text(name)
+    t = norm_text(asset_type)
+    n_upper = n.upper()
+
+    if (
+        c.startswith(('1002', '1021', '1031', '1201', '1202'))
+        or t == '买入返售(逆回购)'
+        or n in ['银行存款', '结算备付金', '存出保证金', '买入返售金融资产']
+        or '逆回购' in n
+        or '质押式' in n
+    ):
+        return '现金类资产'
+
+    if c.startswith('1103.04') or '转债' in n or '可转债' in n:
+        return '转债'
+
+    if c.startswith(('1103', '1104')) or t == '债券' or '资产支持证券' in n:
+        return '信用债'
+
+    if c.startswith('1105') or t == 'ETF/基金投资' or 'ETF' in n_upper or '指数' in n or '中证' in n or '上证' in n or '创业板' in n:
+        return '指数类资产'
+
+    if c.startswith('1102') or t == '股票' or '股票' in n:
+        return '权益'
+
+    return '其他'
+
 def safe_read_table(file):
     """读取 xls/xlsx/csv"""
     file_name = file.name.lower()
@@ -159,10 +212,11 @@ def process_valuation_files(uploaded_files):
     detail_list = []
 
     for file in uploaded_files:
-        file_name = file.name
+        file_name = os.path.basename(file.name)
         base_name = os.path.splitext(file_name)[0]
         product_name = re.sub(r'(_资产估值表.*|_四级.*)$', '', base_name)
         product_name = re.sub(r'^[A-Z0-9]+_', '', product_name)  # 去掉基金代码前缀如 SNK912_
+        valuation_date = extract_valuation_date(file_name)
 
         # 1. 原始读取
         try:
@@ -220,7 +274,9 @@ def process_valuation_files(uploaded_files):
         net_assets = 0.0
         bank_deposit = 0.0
         clearing_prov = 0.0
+        margin_deposit = 0.0
         reverse_repo = 0.0
+        reverse_repo_seen_top = False
         stocks = 0.0
         bonds = 0.0
         others = 0.0
@@ -271,9 +327,15 @@ def process_valuation_files(uploaded_files):
                 clearing_prov = row_val
                 continue
 
+            # 存出保证金：并入“结算备付金及保证金”口径
+            if c_clean == '1031' or n_clean == '存出保证金':
+                margin_deposit = row_val
+                continue
+
             # 买入返售金融资产：你这份表是 1202，不是 1201
             if c_clean in ['1201', '1202'] or n_clean == '买入返售金融资产':
                 reverse_repo = row_val
+                reverse_repo_seen_top = True
                 continue
 
             # ================= B. 底层持仓穿透（有数量才进入明细） =================
@@ -297,6 +359,8 @@ def process_valuation_files(uploaded_files):
 
                     detail_list.append({
                         "所属产品": product_name,
+                        "估值日期": valuation_date,
+                        "文件名": file_name,
                         "资产类别": asset_type,
                         "代码": clean_code,
                         "资产名称": n_raw,
@@ -315,7 +379,8 @@ def process_valuation_files(uploaded_files):
                 elif asset_type == '债券':
                     bonds += v_val
                 elif asset_type == '买入返售(逆回购)':
-                    reverse_repo += v_val
+                    if not reverse_repo_seen_top:
+                        reverse_repo += v_val
                 elif asset_type in ['信托计划', '资管计划', '公募/私募基金', '其他交易性金融资产']:
                     others += v_val
                 elif asset_type == 'ETF/基金投资':
@@ -324,8 +389,10 @@ def process_valuation_files(uploaded_files):
         # 单个产品解析完毕，压入汇总表
         summary_list.append({
             "产品名称": product_name,
+            "估值日期": valuation_date,
+            "文件名": file_name,
             "银行存款": bank_deposit,
-            "结算备付金及保证金": clearing_prov,
+            "结算备付金及保证金": clearing_prov + margin_deposit,
             "股票投资金额": stocks,
             "债券投资金额": bonds,
             "基金投资金额": fund_etf,
@@ -339,6 +406,161 @@ def process_valuation_files(uploaded_files):
     df_det = pd.DataFrame(detail_list)
     return df_sum, df_det
 
+def build_position_allocation(df_sum, df_det):
+    """生成新增 Sheet：按确认口径统计仓位占比，分母为总资产。"""
+    columns = [
+        "产品名称",
+        "现金类资产占比",
+        "信用债占比",
+        "转债占比",
+        "权益占比",
+        "指数类资产占比",
+        "其他",
+        "未统计资产占比",
+    ]
+    if df_sum.empty:
+        return pd.DataFrame(columns=columns)
+
+    include_valuation_date = "估值日期" in df_sum.columns
+    include_file_name = "文件名" in df_sum.columns
+    if include_valuation_date:
+        columns.insert(1, "估值日期")
+    if include_file_name:
+        insert_at = 2 if include_valuation_date else 1
+        columns.insert(insert_at, "文件名")
+
+    bucket_to_col = {
+        "现金类资产": "现金类资产占比",
+        "信用债": "信用债占比",
+        "转债": "转债占比",
+        "权益": "权益占比",
+        "指数类资产": "指数类资产占比",
+        "其他": "其他",
+    }
+
+    result_rows = []
+    detail_df = df_det.copy() if df_det is not None and not df_det.empty else pd.DataFrame()
+
+    for _, sum_row in df_sum.iterrows():
+        product_name = sum_row.get("产品名称", "")
+        valuation_date = sum_row.get("估值日期", "")
+        file_name = sum_row.get("文件名", "")
+        total_assets = parse_num(sum_row.get("总资产", 0))
+        amounts = {bucket: 0.0 for bucket in bucket_to_col}
+
+        # 现金类资产来自顶层科目，避免逆回购明细行重复计算。
+        amounts["现金类资产"] += parse_num(sum_row.get("银行存款", 0))
+        amounts["现金类资产"] += parse_num(sum_row.get("结算备付金及保证金", 0))
+        amounts["现金类资产"] += parse_num(sum_row.get("买入返售金融资产", 0))
+
+        if not detail_df.empty and "所属产品" in detail_df.columns:
+            product_details = detail_df[detail_df["所属产品"] == product_name]
+            if include_valuation_date and "估值日期" in detail_df.columns:
+                product_details = product_details[product_details["估值日期"] == valuation_date]
+            if include_file_name and "文件名" in detail_df.columns:
+                product_details = product_details[product_details["文件名"] == file_name]
+            for _, det_row in product_details.iterrows():
+                bucket = classify_position_bucket(
+                    det_row.get("代码", ""),
+                    det_row.get("资产名称", ""),
+                    det_row.get("资产类别", ""),
+                )
+                if bucket == "现金类资产":
+                    continue
+                amounts[bucket] += parse_num(det_row.get("今日市值", 0))
+
+        out_row = {"产品名称": product_name}
+        if include_valuation_date:
+            out_row["估值日期"] = valuation_date
+        if include_file_name:
+            out_row["文件名"] = file_name
+        classified_ratio = 0.0
+        for bucket, col in bucket_to_col.items():
+            out_row[col] = amounts[bucket] / total_assets if total_assets else 0.0
+            classified_ratio += out_row[col]
+        out_row["未统计资产占比"] = 1.0 - classified_ratio if total_assets else 0.0
+        result_rows.append(out_row)
+
+    return pd.DataFrame(result_rows, columns=columns)
+
+def position_allocation_notes():
+    """仓位占比统计 Sheet 底部备注说明。"""
+    return [
+        ("统计口径", "各项占比均以产品总资产为分母。"),
+        ("现金类资产", "银行存款、结算备付金、存出保证金、买入返售金融资产/逆回购等。"),
+        ("信用债", "普通债券、信用债、资产支持证券等；不含可转债。"),
+        ("转债", "科目代码 1103.04 或名称包含“转债/可转债”的债券。"),
+        ("权益", "股票类资产，包括沪深北交所股票、港股等。"),
+        ("指数类资产", "ETF、指数基金，以及名称包含 ETF/指数/中证/上证/创业板等的资产。"),
+        ("其他", "信托计划、资管计划、私募基金、其他交易性金融资产、违约债权等不穿透资产。"),
+        ("未统计资产", "总资产中未归入上述六类的部分，通常包括应收利息、应收申购款、衍生品估值、其他应收应付轧差等。"),
+    ]
+
+def build_validation_report(df_sum, position_alloc_df):
+    """生成校验/异常提示 Sheet。"""
+    columns = [
+        "产品名称",
+        "估值日期",
+        "文件名",
+        "总资产",
+        "已分类资产占比合计",
+        "未统计资产占比",
+        "异常提示",
+    ]
+    if df_sum.empty:
+        return pd.DataFrame(columns=columns)
+
+    ratio_cols = ["现金类资产占比", "信用债占比", "转债占比", "权益占比", "指数类资产占比", "其他"]
+    key_cols = [col for col in ["产品名称", "估值日期", "文件名"] if col in df_sum.columns and col in position_alloc_df.columns]
+
+    if key_cols:
+        merged = df_sum.merge(position_alloc_df, on=key_cols, how="left", suffixes=("", "_仓位"))
+    else:
+        merged = df_sum.copy()
+        for col in ratio_cols + ["未统计资产占比"]:
+            merged[col] = position_alloc_df[col] if col in position_alloc_df.columns else 0.0
+
+    rows = []
+    for _, row in merged.iterrows():
+        total_assets = parse_num(row.get("总资产", 0))
+        classified_ratio = round(sum(parse_num(row.get(col, 0)) for col in ratio_cols), 10)
+        uncovered_ratio = round(parse_num(row.get("未统计资产占比", 0)), 10)
+
+        if total_assets == 0:
+            message = "总资产缺失或为0"
+        elif classified_ratio > 1.000001 or uncovered_ratio < -0.000001:
+            message = f"分类占比超过100%，超出 {abs(uncovered_ratio):.2%}"
+        elif uncovered_ratio > 0.0001:
+            message = f"未统计资产占比 {uncovered_ratio:.2%}"
+        else:
+            message = "正常"
+
+        rows.append({
+            "产品名称": row.get("产品名称", ""),
+            "估值日期": row.get("估值日期", ""),
+            "文件名": row.get("文件名", ""),
+            "总资产": total_assets,
+            "已分类资产占比合计": classified_ratio,
+            "未统计资产占比": uncovered_ratio,
+            "异常提示": message,
+        })
+
+    return pd.DataFrame(rows, columns=columns)
+
+def build_parse_summary(uploaded_files, df_sum, df_det, validation_df):
+    """生成页面解析摘要。"""
+    file_count = len(uploaded_files)
+    product_count = df_sum["产品名称"].nunique() if "产品名称" in df_sum.columns else 0
+    date_count = df_sum["估值日期"].nunique() if "估值日期" in df_sum.columns else 0
+    detail_count = len(df_det)
+    warning_count = 0
+    if validation_df is not None and not validation_df.empty and "异常提示" in validation_df.columns:
+        warning_count = int((validation_df["异常提示"] != "正常").sum())
+    return (
+        f"解析摘要：成功解析 {file_count} 个文件，覆盖 {product_count} 个产品、{date_count} 个估值日期，"
+        f"底层明细 {detail_count} 条，校验提示 {warning_count} 条。"
+    )
+
 # ================= 跨产品合并分析引擎 =================
 def build_cross_product_analysis(df_sum, df_det):
     """从产品汇总和明细表生成跨产品合并分析"""
@@ -351,28 +573,44 @@ def build_cross_product_analysis(df_sum, df_det):
     if det_with_code.empty:
         return None, None
 
-    # 按代码聚合：统计涉及产品数、各产品持仓、合计市值
-    cross = det_with_code.groupby(['代码', '资产名称', '资产类别']).agg(
-        涉及产品数=('所属产品', 'nunique'),
-        涉及产品=('所属产品', lambda x: '、'.join(sorted(set(x)))),
-        合计数量=('数量', 'sum'),
-        合计成本=('总成本', 'sum'),
-        合计市值=('今日市值', 'sum'),
-        各产品持仓明细=('所属产品', lambda x: ' | '.join(
+    group_cols = []
+    if '估值日期' in det_with_code.columns:
+        group_cols.append('估值日期')
+    group_cols.extend(['代码', '资产名称', '资产类别'])
+
+    agg_kwargs = {
+        '涉及产品数': ('所属产品', 'nunique'),
+        '涉及产品': ('所属产品', lambda x: '、'.join(sorted(set(x)))),
+        '合计数量': ('数量', 'sum'),
+        '合计成本': ('总成本', 'sum'),
+        '合计市值': ('今日市值', 'sum'),
+        '各产品持仓明细': ('所属产品', lambda x: ' | '.join(
             f"{p}({v:,.0f}张, 市值{m:,.2f})" for p, v, m in sorted(
                 set(zip(x, det_with_code.loc[x.index, '数量'], det_with_code.loc[x.index, '今日市值']))
             )
-        ))
-    ).reset_index()
+        )),
+    }
+    if '文件名' in det_with_code.columns:
+        agg_kwargs['涉及文件'] = ('文件名', lambda x: '、'.join(sorted(set(x))))
+
+    # 按估值日期+代码聚合：避免同一产品不同日期混在一起
+    cross = det_with_code.groupby(group_cols).agg(**agg_kwargs).reset_index()
 
     # 按合计市值降序，跨产品持有的排前面
     cross['排序键'] = cross['涉及产品数'].apply(lambda x: 0 if x >= 2 else 1)
-    cross = cross.sort_values(['排序键', '合计市值'], ascending=[True, False]).drop(columns=['排序键'])
+    sort_cols = ['排序键']
+    ascending = [True]
+    if '估值日期' in cross.columns:
+        sort_cols.append('估值日期')
+        ascending.append(False)
+    sort_cols.append('合计市值')
+    ascending.append(False)
+    cross = cross.sort_values(sort_cols, ascending=ascending).drop(columns=['排序键'])
     cross = cross.reset_index(drop=True)
 
     # ---- Sheet 3b: 产品资产配置对比（仅占比，金额已在 Sheet 1） ----
     if not df_sum.empty:
-        alloc = df_sum.copy().set_index('产品名称')
+        alloc = df_sum.copy()
         total_cols = ['银行存款', '结算备付金及保证金', '股票投资金额', '债券投资金额', '基金投资金额', '买入返售金融资产', '其他交易性金融资产']
         pct_cols = []
         for col in total_cols:
@@ -380,7 +618,8 @@ def build_cross_product_analysis(df_sum, df_det):
                 pct_name = col.replace('投资金额', '').replace('金融资产', '')
                 alloc[pct_name + '占比'] = alloc[col] / alloc['总资产'].replace(0, np.nan)
                 pct_cols.append(pct_name + '占比')
-        alloc = alloc[pct_cols].reset_index()  # 仅保留占比列
+        id_cols = [col for col in ['产品名称', '估值日期', '文件名'] if col in alloc.columns]
+        alloc = alloc[id_cols + pct_cols]  # 仅保留标识列和占比列
     else:
         alloc = None
 
@@ -397,8 +636,11 @@ uploaded_files = st.file_uploader(
 if uploaded_files:
     with st.spinner("引擎正在进行二维坐标矩阵重构与底层资产穿透..."):
         df_sum, df_det = process_valuation_files(uploaded_files)
+        position_alloc_df = build_position_allocation(df_sum, df_det)
+        validation_df = build_validation_report(df_sum, position_alloc_df)
 
     st.success(f"成功解析 {len(uploaded_files)} 个产品！")
+    st.info(build_parse_summary(uploaded_files, df_sum, df_det, validation_df))
 
     # ---- 跨产品合并分析 ----
     cross_df, alloc_df = None, None
@@ -409,6 +651,8 @@ if uploaded_files:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         df_sum.to_excel(writer, sheet_name='产品概况', index=False)
+        position_alloc_df.to_excel(writer, sheet_name='仓位占比统计', index=False)
+        validation_df.to_excel(writer, sheet_name='校验提示', index=False)
         df_det.to_excel(writer, sheet_name='资产明细', index=False)
         if cross_df is not None and not cross_df.empty:
             cross_df.to_excel(writer, sheet_name='跨产品合并', index=False)
@@ -473,6 +717,41 @@ if uploaded_files:
                         except (ValueError, TypeError):
                             pass
 
+            if ws.title == '仓位占比统计':
+                for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=2, max_col=ws.max_column):
+                    for cell in row:
+                        if isinstance(cell.value, (int, float)):
+                            cell.number_format = '0.00%'
+
+                note_start_row = ws.max_row + 2
+                ws.cell(note_start_row, 1, "备注")
+                ws.cell(note_start_row, 1).font = Font(name='微软雅黑', size=11, bold=True)
+                ws.cell(note_start_row, 1).alignment = cell_align_left
+
+                for offset, (bucket, note) in enumerate(position_allocation_notes(), start=1):
+                    type_cell = ws.cell(note_start_row + offset, 1, bucket)
+                    note_cell = ws.cell(note_start_row + offset, 2, note)
+                    type_cell.font = Font(name='微软雅黑', size=10, bold=True)
+                    type_cell.fill = PatternFill(start_color='D9EAF7', end_color='D9EAF7', fill_type='solid')
+                    type_cell.alignment = cell_align_left
+                    note_cell.font = cell_font
+                    note_cell.alignment = Alignment(horizontal='left', vertical='center', wrap_text=True)
+                    for c in (type_cell, note_cell):
+                        c.border = thin_border
+
+            if ws.title == '校验提示':
+                for header_cell in ws[1]:
+                    if '占比' in str(header_cell.value):
+                        for cell in ws.iter_cols(
+                            min_col=header_cell.column,
+                            max_col=header_cell.column,
+                            min_row=2,
+                            max_row=ws.max_row,
+                        ):
+                            for c in cell:
+                                if isinstance(c.value, (int, float)):
+                                    c.number_format = '0.00%'
+
             for col_idx in range(1, ws.max_column + 1):
                 col_letter = get_column_letter(col_idx)
                 max_width = 8
@@ -484,19 +763,10 @@ if uploaded_files:
                             max_width = max(max_width, min(width + 4, 55))
                 ws.column_dimensions[col_letter].width = max_width
 
-    # 提取估值表日期用于输出文件名
-    val_date = ""
-    try:
-        date_match = re.search(r'_(\d{8})_', uploaded_files[0].name)
-        if date_match:
-            val_date = "_" + date_match.group(1)
-    except Exception:
-        pass
-
     st.download_button(
         label="📥 点击下载精算级汇总 Excel 报表",
         data=output.getvalue(),
-        file_name=f"私募产品多维度估值透视表{val_date}.xlsx",
+        file_name=build_output_filename(uploaded_files),
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
@@ -505,11 +775,27 @@ if uploaded_files:
     st.subheader("📋 Sheet 1: 产品资产概况")
     df_sum_show = df_sum.copy()
     for col in df_sum_show.columns:
-        if col != "产品名称":
+        if col not in ["产品名称", "估值日期", "文件名"]:
             df_sum_show[col] = df_sum_show[col].apply(lambda x: f"{x:,.2f}")
     st.dataframe(df_sum_show, use_container_width=True)
 
-    st.subheader("🔍 Sheet 2: 底层资产明细")
+    st.subheader("📊 Sheet 2: 仓位占比统计")
+    position_alloc_show = position_alloc_df.copy()
+    for col in position_alloc_show.columns:
+        if col not in ["产品名称", "估值日期", "文件名"]:
+            position_alloc_show[col] = position_alloc_show[col].apply(lambda x: f"{x:.2%}" if pd.notna(x) else "")
+    st.dataframe(position_alloc_show, use_container_width=True)
+
+    st.subheader("⚠️ Sheet 3: 校验提示")
+    validation_show = validation_df.copy()
+    for col in validation_show.columns:
+        if '占比' in str(col):
+            validation_show[col] = validation_show[col].apply(lambda x: f"{x:.2%}" if pd.notna(x) else "")
+        elif col == "总资产":
+            validation_show[col] = validation_show[col].apply(lambda x: f"{x:,.2f}")
+    st.dataframe(validation_show, use_container_width=True)
+
+    st.subheader("🔍 Sheet 4: 底层资产明细")
     df_det_show = df_det.copy()
     if not df_det_show.empty:
         for col in ['数量', '单位成本', '总成本', '今日行情', '今日市值']:
@@ -519,7 +805,7 @@ if uploaded_files:
 
     # ---- Sheet 3: 跨产品合并分析 ----
     if cross_df is not None and not cross_df.empty:
-        st.subheader("🔗 Sheet 3: 跨产品合并分析")
+        st.subheader("🔗 Sheet 5: 跨产品合并分析")
 
         st.markdown("**跨产品重仓证券**（同一只券被多个产品持有，合并计算敞口）")
         cross_show = cross_df.copy()
@@ -534,7 +820,7 @@ if uploaded_files:
             for col in alloc_show.columns:
                 if '占比' in str(col):
                     alloc_show[col] = alloc_show[col].apply(lambda x: f"{x:.2%}" if pd.notna(x) else "")
-                elif col != "产品名称":
+                elif col not in ["产品名称", "估值日期", "文件名"]:
                     alloc_show[col] = alloc_show[col].apply(lambda x: f"{x:,.2f}")
             st.dataframe(alloc_show, use_container_width=True)
     elif len(uploaded_files) >= 2:
