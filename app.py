@@ -163,12 +163,17 @@ def classify_position_bucket(code, name, asset_type=""):
 
     if (
         c.startswith(('1002', '1021', '1031', '1201', '1202'))
+        or t == '现金类资产'
         or t == '买入返售(逆回购)'
         or n in ['银行存款', '结算备付金', '存出保证金', '买入返售金融资产']
         or '逆回购' in n
         or '质押式' in n
     ):
         return '现金类资产'
+
+    # 违约债权名称中可能包含“中证”（估值来源），不能因此误归为指数资产。
+    if t in ['其他交易性金融资产', '其他/未统计资产'] or '违约' in n or '未清偿债权' in n:
+        return '其他'
 
     if c.startswith('1103.04') or '转债' in n or '可转债' in n:
         return '转债'
@@ -217,6 +222,7 @@ def process_valuation_files(uploaded_files):
         product_name = re.sub(r'(_资产估值表.*|_四级.*)$', '', base_name)
         product_name = re.sub(r'^[A-Z0-9]+_', '', product_name)  # 去掉基金代码前缀如 SNK912_
         valuation_date = extract_valuation_date(file_name)
+        detail_start_idx = len(detail_list)
 
         # 1. 原始读取
         try:
@@ -354,7 +360,11 @@ def process_valuation_files(uploaded_files):
                     continue
 
                 # 明细表：只记录资产类持仓
-                if c_clean.startswith(('1102', '1103', '1104', '1105', '1108', '1201', '1202')):
+                # 逆回购统一使用顶层金额追加为现金类明细，避免顶层与底层重复记录。
+                if (
+                    c_clean.startswith(('1102', '1103', '1104', '1105', '1108'))
+                    and asset_type != '买入返售(逆回购)'
+                ):
                     clean_code = "逆回购" if asset_type == '买入返售(逆回购)' else extract_ticker(c_raw)
 
                     detail_list.append({
@@ -386,6 +396,52 @@ def process_valuation_files(uploaded_files):
                 elif asset_type == 'ETF/基金投资':
                     fund_etf += v_val
 
+        # 将没有数量的顶层现金科目补入资产明细。
+        cash_details = [
+            ('1002', '银行存款', bank_deposit),
+            ('1021/1031', '结算备付金及保证金', clearing_prov + margin_deposit),
+            ('1201/1202', '买入返售金融资产', reverse_repo),
+        ]
+        for cash_code, cash_name, cash_value in cash_details:
+            if abs(cash_value) <= 1e-9:
+                continue
+            detail_list.append({
+                "所属产品": product_name,
+                "估值日期": valuation_date,
+                "文件名": file_name,
+                "资产类别": "现金类资产",
+                "代码": cash_code,
+                "资产名称": cash_name,
+                "数量": 0.0,
+                "单位成本": 0.0,
+                "总成本": cash_value,
+                "今日行情": 0.0,
+                "今日市值": cash_value,
+            })
+
+        # 证券明细和显式现金仍可能未覆盖应收款、衍生品估值等资产。
+        # 单列补差项目，使每个产品的资产明细与总资产严格闭合。
+        if total_assets != 0:
+            captured_assets = sum(
+                parse_num(item.get("今日市值", 0))
+                for item in detail_list[detail_start_idx:]
+            )
+            residual_assets = total_assets - captured_assets
+            if abs(residual_assets) > 1e-6:
+                detail_list.append({
+                    "所属产品": product_name,
+                    "估值日期": valuation_date,
+                    "文件名": file_name,
+                    "资产类别": "其他/未统计资产",
+                    "代码": "RESIDUAL",
+                    "资产名称": "未统计资产补差",
+                    "数量": 0.0,
+                    "单位成本": 0.0,
+                    "总成本": residual_assets,
+                    "今日行情": 0.0,
+                    "今日市值": residual_assets,
+                })
+
         # 单个产品解析完毕，压入汇总表
         summary_list.append({
             "产品名称": product_name,
@@ -403,8 +459,103 @@ def process_valuation_files(uploaded_files):
         })
 
     df_sum = pd.DataFrame(summary_list)
-    df_det = pd.DataFrame(detail_list)
+    detail_columns = [
+        "所属产品", "估值日期", "文件名", "资产类别", "代码", "资产名称",
+        "数量", "单位成本", "总成本", "今日行情", "今日市值", "占比",
+    ]
+    df_det = pd.DataFrame(detail_list, columns=detail_columns[:-1])
+    if df_det.empty:
+        df_det = pd.DataFrame(columns=detail_columns)
+    else:
+        total_assets_map = {
+            (row["产品名称"], row["估值日期"], row["文件名"]): parse_num(row["总资产"])
+            for row in summary_list
+        }
+        df_det["占比"] = df_det.apply(
+            lambda row: (
+                parse_num(row["今日市值"])
+                / total_assets_map.get((row["所属产品"], row["估值日期"], row["文件名"]), 0)
+                if total_assets_map.get((row["所属产品"], row["估值日期"], row["文件名"]), 0)
+                else 0.0
+            ),
+            axis=1,
+        )
     return df_sum, df_det
+
+
+def build_hierarchical_detail(df_sum, df_det):
+    """生成产品 → 资产类别 → 资产名称三级明细占比表。"""
+    columns = ["层级", "行标签", "代码", "今日市值", "占比", "估值日期", "文件名"]
+    if df_sum.empty:
+        return pd.DataFrame(columns=columns)
+
+    category_order = [
+        "现金类资产", "股票", "债券", "ETF/基金投资", "公募/私募基金",
+        "信托计划", "资管计划", "其他交易性金融资产", "其他/未统计资产", "未分类",
+    ]
+    category_rank = {name: idx for idx, name in enumerate(category_order)}
+    result_rows = []
+
+    for _, sum_row in df_sum.iterrows():
+        product_name = sum_row.get("产品名称", "")
+        valuation_date = sum_row.get("估值日期", "")
+        file_name = sum_row.get("文件名", "")
+        details = df_det[
+            (df_det["所属产品"] == product_name)
+            & (df_det["估值日期"] == valuation_date)
+            & (df_det["文件名"] == file_name)
+        ].copy()
+
+        product_value = details["今日市值"].apply(parse_num).sum() if not details.empty else 0.0
+        product_ratio = details["占比"].apply(parse_num).sum() if not details.empty else 0.0
+        result_rows.append({
+            "层级": "产品",
+            "行标签": product_name,
+            "代码": "",
+            "今日市值": product_value,
+            "占比": product_ratio,
+            "估值日期": valuation_date,
+            "文件名": file_name,
+        })
+
+        if details.empty:
+            continue
+
+        categories = sorted(
+            details["资产类别"].fillna("未分类").unique(),
+            key=lambda x: (category_rank.get(x, len(category_rank)), str(x)),
+        )
+        for category in categories:
+            category_details = details[details["资产类别"].fillna("未分类") == category].copy()
+            category_value = category_details["今日市值"].apply(parse_num).sum()
+            category_ratio = category_details["占比"].apply(parse_num).sum()
+            result_rows.append({
+                "层级": "资产类别",
+                "行标签": category,
+                "代码": "",
+                "今日市值": category_value,
+                "占比": category_ratio,
+                "估值日期": valuation_date,
+                "文件名": file_name,
+            })
+
+            grouped = (
+                category_details.groupby(["资产名称", "代码"], dropna=False, as_index=False)
+                .agg({"今日市值": "sum", "占比": "sum"})
+                .sort_values("今日市值", key=lambda s: s.abs(), ascending=False)
+            )
+            for _, detail_row in grouped.iterrows():
+                result_rows.append({
+                    "层级": "资产明细",
+                    "行标签": detail_row.get("资产名称", ""),
+                    "代码": detail_row.get("代码", ""),
+                    "今日市值": parse_num(detail_row.get("今日市值", 0)),
+                    "占比": parse_num(detail_row.get("占比", 0)),
+                    "估值日期": valuation_date,
+                    "文件名": file_name,
+                })
+
+    return pd.DataFrame(result_rows, columns=columns)
 
 def build_position_allocation(df_sum, df_det):
     """生成新增 Sheet：按确认口径统计仓位占比，分母为总资产。"""
@@ -492,17 +643,19 @@ def position_allocation_notes():
         ("转债", "科目代码 1103.04 或名称包含“转债/可转债”的债券。"),
         ("权益", "股票类资产，包括沪深北交所股票、港股等。"),
         ("指数类资产", "ETF、指数基金，以及名称包含 ETF/指数/中证/上证/创业板等的资产。"),
-        ("其他", "信托计划、资管计划、私募基金、其他交易性金融资产、违约债权等不穿透资产。"),
-        ("未统计资产", "总资产中未归入上述六类的部分，通常包括应收利息、应收申购款、衍生品估值、其他应收应付轧差等。"),
+        ("其他", "信托计划、资管计划、私募基金、其他交易性金融资产、违约债权及明细补差等。"),
+        ("未统计资产", "完整资产明细已通过“其他/未统计资产”补差闭合；本列正常应为 0。"),
     ]
 
-def build_validation_report(df_sum, position_alloc_df):
+def build_validation_report(df_sum, position_alloc_df, df_det=None):
     """生成校验/异常提示 Sheet。"""
     columns = [
         "产品名称",
         "估值日期",
         "文件名",
         "总资产",
+        "明细占比合计",
+        "补差资产占比",
         "已分类资产占比合计",
         "未统计资产占比",
         "异常提示",
@@ -526,11 +679,38 @@ def build_validation_report(df_sum, position_alloc_df):
         classified_ratio = round(sum(parse_num(row.get(col, 0)) for col in ratio_cols), 10)
         uncovered_ratio = round(parse_num(row.get("未统计资产占比", 0)), 10)
 
+        product_details = pd.DataFrame()
+        if df_det is not None and not df_det.empty and "所属产品" in df_det.columns:
+            product_details = df_det[df_det["所属产品"] == row.get("产品名称", "")]
+            if "估值日期" in df_det.columns:
+                product_details = product_details[product_details["估值日期"] == row.get("估值日期", "")]
+            if "文件名" in df_det.columns:
+                product_details = product_details[product_details["文件名"] == row.get("文件名", "")]
+
+        detail_ratio = round(
+            sum(parse_num(value) for value in product_details.get("占比", pd.Series(dtype=float))),
+            10,
+        )
+        residual_ratio = round(
+            sum(
+                parse_num(value)
+                for value in product_details.loc[
+                    product_details.get("资产类别", pd.Series(index=product_details.index, dtype=str)) == "其他/未统计资产",
+                    "占比",
+                ]
+            ) if not product_details.empty and "占比" in product_details.columns else 0.0,
+            10,
+        )
+
         if total_assets == 0:
             message = "总资产缺失或为0"
+        elif abs(detail_ratio - 1.0) > 0.000001:
+            message = f"资产明细占比合计 {detail_ratio:.2%}，未闭合至100%"
         elif classified_ratio > 1.000001 or uncovered_ratio < -0.000001:
             message = f"分类占比超过100%，超出 {abs(uncovered_ratio):.2%}"
-        elif uncovered_ratio > 0.0001:
+        elif abs(residual_ratio) > 0.0001:
+            message = f"补差资产占比 {residual_ratio:.2%}"
+        elif abs(uncovered_ratio) > 0.0001:
             message = f"未统计资产占比 {uncovered_ratio:.2%}"
         else:
             message = "正常"
@@ -540,6 +720,8 @@ def build_validation_report(df_sum, position_alloc_df):
             "估值日期": row.get("估值日期", ""),
             "文件名": row.get("文件名", ""),
             "总资产": total_assets,
+            "明细占比合计": detail_ratio,
+            "补差资产占比": residual_ratio,
             "已分类资产占比合计": classified_ratio,
             "未统计资产占比": uncovered_ratio,
             "异常提示": message,
@@ -569,7 +751,13 @@ def build_cross_product_analysis(df_sum, df_det):
 
     # ---- Sheet 3a: 跨产品重仓证券 ----
     # 仅保留有代码的证券（排除"逆回购"通用标记）
-    det_with_code = df_det[df_det['代码'].notna() & (df_det['代码'] != '') & (df_det['代码'] != '逆回购')].copy()
+    excluded_types = ['现金类资产', '其他/未统计资产', '买入返售(逆回购)']
+    det_with_code = df_det[
+        df_det['代码'].notna()
+        & (df_det['代码'] != '')
+        & (df_det['代码'] != '逆回购')
+        & (~df_det['资产类别'].isin(excluded_types))
+    ].copy()
     if det_with_code.empty:
         return None, None
 
@@ -636,8 +824,9 @@ uploaded_files = st.file_uploader(
 if uploaded_files:
     with st.spinner("引擎正在进行二维坐标矩阵重构与底层资产穿透..."):
         df_sum, df_det = process_valuation_files(uploaded_files)
+        hierarchical_df = build_hierarchical_detail(df_sum, df_det)
         position_alloc_df = build_position_allocation(df_sum, df_det)
-        validation_df = build_validation_report(df_sum, position_alloc_df)
+        validation_df = build_validation_report(df_sum, position_alloc_df, df_det)
 
     st.success(f"成功解析 {len(uploaded_files)} 个产品！")
     st.info(build_parse_summary(uploaded_files, df_sum, df_det, validation_df))
@@ -653,6 +842,7 @@ if uploaded_files:
         df_sum.to_excel(writer, sheet_name='产品概况', index=False)
         position_alloc_df.to_excel(writer, sheet_name='仓位占比统计', index=False)
         validation_df.to_excel(writer, sheet_name='校验提示', index=False)
+        hierarchical_df.to_excel(writer, sheet_name='分级明细占比', index=False)
         df_det.to_excel(writer, sheet_name='资产明细', index=False)
         if cross_df is not None and not cross_df.empty:
             cross_df.to_excel(writer, sheet_name='跨产品合并', index=False)
@@ -739,6 +929,63 @@ if uploaded_files:
                     for c in (type_cell, note_cell):
                         c.border = thin_border
 
+            if ws.title == '分级明细占比':
+                level_col_idx = None
+                label_col_idx = None
+                ratio_col_idx = None
+                for col_idx, cell in enumerate(ws[1], 1):
+                    if cell.value == '层级':
+                        level_col_idx = col_idx
+                    elif cell.value == '行标签':
+                        label_col_idx = col_idx
+                    elif cell.value == '占比':
+                        ratio_col_idx = col_idx
+
+                if level_col_idx and label_col_idx:
+                    ws.sheet_properties.outlinePr.summaryBelow = False
+                    for row_idx in range(2, ws.max_row + 1):
+                        level = ws.cell(row_idx, level_col_idx).value
+                        label_cell = ws.cell(row_idx, label_col_idx)
+                        if level == '产品':
+                            for cell in ws[row_idx]:
+                                cell.font = Font(name='微软雅黑', size=10, bold=True, color='FFFFFF')
+                                cell.fill = PatternFill(start_color='4472C4', end_color='4472C4', fill_type='solid')
+                            label_cell.alignment = Alignment(horizontal='left', vertical='center', indent=0)
+                        elif level == '资产类别':
+                            ws.row_dimensions[row_idx].outlineLevel = 1
+                            for cell in ws[row_idx]:
+                                cell.font = Font(name='微软雅黑', size=10, bold=True)
+                                cell.fill = PatternFill(start_color='D9EAF7', end_color='D9EAF7', fill_type='solid')
+                            label_cell.alignment = Alignment(horizontal='left', vertical='center', indent=1)
+                        else:
+                            ws.row_dimensions[row_idx].outlineLevel = 2
+                            label_cell.alignment = Alignment(horizontal='left', vertical='center', indent=2)
+                    ws.column_dimensions[get_column_letter(level_col_idx)].hidden = True
+
+                if ratio_col_idx:
+                    for cell in ws.iter_cols(
+                        min_col=ratio_col_idx,
+                        max_col=ratio_col_idx,
+                        min_row=2,
+                        max_row=ws.max_row,
+                    ):
+                        for c in cell:
+                            if isinstance(c.value, (int, float)):
+                                c.number_format = '0.00%'
+
+            if ws.title == '资产明细':
+                for header_cell in ws[1]:
+                    if header_cell.value == '占比':
+                        for cell in ws.iter_cols(
+                            min_col=header_cell.column,
+                            max_col=header_cell.column,
+                            min_row=2,
+                            max_row=ws.max_row,
+                        ):
+                            for c in cell:
+                                if isinstance(c.value, (int, float)):
+                                    c.number_format = '0.00%'
+
             if ws.title == '校验提示':
                 for header_cell in ws[1]:
                     if '占比' in str(header_cell.value):
@@ -795,17 +1042,26 @@ if uploaded_files:
             validation_show[col] = validation_show[col].apply(lambda x: f"{x:,.2f}")
     st.dataframe(validation_show, use_container_width=True)
 
-    st.subheader("🔍 Sheet 4: 底层资产明细")
+    st.subheader("🌳 Sheet 4: 分级明细占比")
+    hierarchical_show = hierarchical_df.copy()
+    if not hierarchical_show.empty:
+        hierarchical_show["今日市值"] = hierarchical_show["今日市值"].apply(lambda x: f"{x:,.2f}")
+        hierarchical_show["占比"] = hierarchical_show["占比"].apply(lambda x: f"{x:.2%}")
+    st.dataframe(hierarchical_show, use_container_width=True)
+
+    st.subheader("🔍 Sheet 5: 底层资产明细")
     df_det_show = df_det.copy()
     if not df_det_show.empty:
         for col in ['数量', '单位成本', '总成本', '今日行情', '今日市值']:
             if col in df_det_show.columns:
                 df_det_show[col] = df_det_show[col].apply(lambda x: f"{x:,.2f}")
+        if '占比' in df_det_show.columns:
+            df_det_show['占比'] = df_det_show['占比'].apply(lambda x: f"{x:.2%}")
     st.dataframe(df_det_show, use_container_width=True)
 
     # ---- Sheet 3: 跨产品合并分析 ----
     if cross_df is not None and not cross_df.empty:
-        st.subheader("🔗 Sheet 5: 跨产品合并分析")
+        st.subheader("🔗 Sheet 6: 跨产品合并分析")
 
         st.markdown("**跨产品重仓证券**（同一只券被多个产品持有，合并计算敞口）")
         cross_show = cross_df.copy()
