@@ -5,6 +5,13 @@ import io
 import re
 import os
 
+from report_layout import (
+    move_filename_column_to_end,
+    normalize_product_report,
+    product_priority,
+    sort_product_names,
+)
+
 # ================= 页面配置 =================
 st.set_page_config(page_title="私募资管产品估值表分析系统", layout="wide")
 st.title("📊 私募资管产品估值表精算系统 (底层数组坐标版)")
@@ -480,6 +487,8 @@ def process_valuation_files(uploaded_files):
             ),
             axis=1,
         )
+    df_sum = normalize_product_report(df_sum, "产品名称")
+    df_det = normalize_product_report(df_det, "所属产品")
     return df_sum, df_det
 
 
@@ -488,6 +497,8 @@ def build_hierarchical_detail(df_sum, df_det):
     columns = ["层级", "行标签", "代码", "今日市值", "占比", "估值日期", "文件名"]
     if df_sum.empty:
         return pd.DataFrame(columns=columns)
+
+    df_sum = normalize_product_report(df_sum, "产品名称")
 
     category_order = [
         "现金类资产", "股票", "债券", "ETF/基金投资", "公募/私募基金",
@@ -555,7 +566,7 @@ def build_hierarchical_detail(df_sum, df_det):
                     "文件名": file_name,
                 })
 
-    return pd.DataFrame(result_rows, columns=columns)
+    return move_filename_column_to_end(pd.DataFrame(result_rows, columns=columns))
 
 def build_position_allocation(df_sum, df_det):
     """生成新增 Sheet：按确认口径统计仓位占比，分母为总资产。"""
@@ -632,7 +643,8 @@ def build_position_allocation(df_sum, df_det):
         out_row["未统计资产占比"] = 1.0 - classified_ratio if total_assets else 0.0
         result_rows.append(out_row)
 
-    return pd.DataFrame(result_rows, columns=columns)
+    result = pd.DataFrame(result_rows, columns=columns)
+    return normalize_product_report(result, "产品名称")
 
 def position_allocation_notes():
     """仓位占比统计 Sheet 底部备注说明。"""
@@ -727,7 +739,8 @@ def build_validation_report(df_sum, position_alloc_df, df_det=None):
             "异常提示": message,
         })
 
-    return pd.DataFrame(rows, columns=columns)
+    result = pd.DataFrame(rows, columns=columns)
+    return normalize_product_report(result, "产品名称")
 
 def build_parse_summary(uploaded_files, df_sum, df_det, validation_df):
     """生成页面解析摘要。"""
@@ -766,17 +779,25 @@ def build_cross_product_analysis(df_sum, df_det):
         group_cols.append('估值日期')
     group_cols.extend(['代码', '资产名称', '资产类别'])
 
+    def format_product_holdings(products):
+        records = list(dict.fromkeys(zip(
+            products,
+            det_with_code.loc[products.index, '数量'],
+            det_with_code.loc[products.index, '今日市值'],
+        )))
+        records.sort(key=lambda item: product_priority(item[0]))
+        return ' | '.join(
+            f"{product}({quantity:,.0f}张, 市值{market_value:,.2f})"
+            for product, quantity, market_value in records
+        )
+
     agg_kwargs = {
         '涉及产品数': ('所属产品', 'nunique'),
-        '涉及产品': ('所属产品', lambda x: '、'.join(sorted(set(x)))),
+        '涉及产品': ('所属产品', lambda x: '、'.join(sort_product_names(x.tolist()))),
         '合计数量': ('数量', 'sum'),
         '合计成本': ('总成本', 'sum'),
         '合计市值': ('今日市值', 'sum'),
-        '各产品持仓明细': ('所属产品', lambda x: ' | '.join(
-            f"{p}({v:,.0f}张, 市值{m:,.2f})" for p, v, m in sorted(
-                set(zip(x, det_with_code.loc[x.index, '数量'], det_with_code.loc[x.index, '今日市值']))
-            )
-        )),
+        '各产品持仓明细': ('所属产品', format_product_holdings),
     }
     if '文件名' in det_with_code.columns:
         agg_kwargs['涉及文件'] = ('文件名', lambda x: '、'.join(sorted(set(x))))
@@ -795,6 +816,7 @@ def build_cross_product_analysis(df_sum, df_det):
     ascending.append(False)
     cross = cross.sort_values(sort_cols, ascending=ascending).drop(columns=['排序键'])
     cross = cross.reset_index(drop=True)
+    cross = move_filename_column_to_end(cross, '涉及文件')
 
     # ---- Sheet 3b: 产品资产配置对比（仅占比，金额已在 Sheet 1） ----
     if not df_sum.empty:
@@ -808,6 +830,7 @@ def build_cross_product_analysis(df_sum, df_det):
                 pct_cols.append(pct_name + '占比')
         id_cols = [col for col in ['产品名称', '估值日期', '文件名'] if col in alloc.columns]
         alloc = alloc[id_cols + pct_cols]  # 仅保留标识列和占比列
+        alloc = normalize_product_report(alloc, '产品名称')
     else:
         alloc = None
 
