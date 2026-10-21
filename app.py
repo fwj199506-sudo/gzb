@@ -188,8 +188,12 @@ def classify_position_bucket(code, name, asset_type=""):
     if c.startswith(('1103', '1104')) or t == '债券' or '资产支持证券' in n:
         return '信用债'
 
-    if c.startswith('1105') or t == 'ETF/基金投资' or 'ETF' in n_upper or '指数' in n or '中证' in n or '上证' in n or '创业板' in n:
+    # 基金科目/类别本身不能证明是指数基金；仅采用明确的名称标识。
+    if 'ETF' in n_upper or '指数' in n:
         return '指数类资产'
+
+    if c.startswith('1105') or t in ['ETF/基金投资', '公募/私募基金']:
+        return '其他'
 
     if c.startswith('1102') or t == '股票' or '股票' in n:
         return '权益'
@@ -286,6 +290,7 @@ def process_valuation_files(uploaded_files):
         total_assets = 0.0
         net_assets = 0.0
         bank_deposit = 0.0
+        bank_rows = {}
         clearing_prov = 0.0
         margin_deposit = 0.0
         reverse_repo = 0.0
@@ -329,10 +334,16 @@ def process_valuation_files(uploaded_files):
                 net_assets = row_val
                 continue
 
-            # 银行存款：你要求新增这一列
-            # 这类通常是 1002 顶层行
-            if c_clean == '1002' or n_clean == '银行存款':
-                bank_deposit = row_val
+            # 先收集银行存款层级，解析结束后统一去重，避免依赖行顺序。
+            if c_clean.startswith('1002') or n_clean == '银行存款':
+                bank_code = c_clean if c_clean.startswith('1002') else '1002'
+                # 金额列存在时零值也有效，不能兜底取到科目代码 1002。
+                bank_value = 0.0
+                for amount_idx in (idx_mkt, idx_cost):
+                    if amount_idx != -1 and norm_text(row[amount_idx]) not in ['', 'nan', 'None', '-', '--']:
+                        bank_value = parse_num(row[amount_idx])
+                        break
+                bank_rows[bank_code] = bank_value
                 continue
 
             # 结算备付金：只取顶层 1021，避免把 1021.81、1021.B1 等子项重复加总
@@ -402,6 +413,19 @@ def process_valuation_files(uploaded_files):
                     others += v_val
                 elif asset_type == 'ETF/基金投资':
                     fund_etf += v_val
+
+        # 每个分支取最浅的现有节点；有 1002 时自然覆盖所有下级。
+        # 点分科目按完整段匹配，避免把 1002.01 当成 1002.010 的父级。
+        bank_deposit = sum(
+            value for code, value in bank_rows.items()
+            if not any(
+                parent != code and (
+                    code.startswith(parent + '.')
+                    or (parent.isdigit() and code.startswith(parent))
+                )
+                for parent in bank_rows
+            )
+        )
 
         # 将没有数量的顶层现金科目补入资产明细。
         cash_details = [
@@ -654,7 +678,7 @@ def position_allocation_notes():
         ("信用债", "普通债券、信用债、资产支持证券等；不含可转债。"),
         ("转债", "科目代码 1103.04 或名称包含“转债/可转债”的债券。"),
         ("权益", "股票类资产，包括沪深北交所股票、港股等。"),
-        ("指数类资产", "ETF、指数基金，以及名称包含 ETF/指数/中证/上证/创业板等的资产。"),
+        ("指数类资产", "名称明确包含 ETF（不区分大小写）或指数的资产；普通基金及无法确认指数属性的基金计入其他。"),
         ("其他", "信托计划、资管计划、私募基金、其他交易性金融资产、违约债权及明细补差等。"),
         ("未统计资产", "完整资产明细已通过“其他/未统计资产”补差闭合；本列正常应为 0。"),
     ]
